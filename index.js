@@ -253,7 +253,7 @@ function formatAlert(htfAOI, choch, ltfAOI, currentPrice, session) {
   const tp = "Most recent liquidity level";
 
   return (
-    `${emoji} <b>PLAYBOOK V2 — FULL SETUP ALERT</b> ${arrow}\n` +
+    `${emoji} <b>NQ_Devbmt — FULL SETUP ALERT</b> ${arrow}\n` +
     `━━━━━━━━━━━━━━━━━━━━\n` +
     `<b>Instrument:</b>  NQ Futures\n` +
     `<b>Session:</b>     ${session}\n` +
@@ -477,7 +477,7 @@ function validateConfig() {
 // ─────────────────────────────────────────────────────────
 async function start() {
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-  console.log("🤖  Playbook V2 Alert Bot");
+  console.log("🤖  NQ_Devbmt Alert Bot");
   console.log("📊  Instrument: NQ Futures (NQ=F)");
   console.log("📡  Data: Yahoo Finance (free, no API key)");
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -491,9 +491,8 @@ async function start() {
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
   await sendTelegram(
-    `🤖 <b>Playbook V2 Bot is Online</b>\n\n` +
-    `<b>Instrument:</b> NQ Futures\n` +
-    `<b>Data source:</b> Yahoo Finance (free)\n\n` +
+    `🤖 <b>NQ_Devbmt Bot is Online</b>\n\n` +
+    `<b>Instrument:</b> NQ Futures\n\n` +
     `<b>Active sessions:</b>\n` +
     `• London: 2:00am — 4:30am EST\n` +
     `• Asia: 7:00pm — 9:30pm EST\n\n` +
