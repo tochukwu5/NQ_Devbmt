@@ -8,22 +8,9 @@ const yahooFinance = require("yahoo-finance2").default;
 const CONFIG = {
   telegramToken:  process.env.TELEGRAM_TOKEN,
   telegramChatId: process.env.TELEGRAM_CHAT_ID,
-  symbol:         "NQ=F",   // NQ Futures on Yahoo Finance
-  scanInterval:   60 * 1000, // scan every 60 seconds
-};
-
-// ─────────────────────────────────────────────────────────
-// YAHOO FINANCE INTERVAL MAP
-// Maps our timeframe names to Yahoo Finance interval strings
-// ─────────────────────────────────────────────────────────
-const YF_INTERVAL = {
-  "1m":   "1m",
-  "5m":   "5m",
-  "15m":  "15m",
-  "30m":  "30m",
-  "1H":   "1h",
-  "4H":   "4h",  // Note: Yahoo Finance uses 1h, bot builds 4H from 1h
-  "1D":   "1d",
+  symbol:         "NQ=F",        // NQ Futures on Yahoo Finance
+  activeScanMs:   60  * 1000,    // 60 seconds during active session
+  idleScanMs:     5 * 60 * 1000, // 5 minutes outside session (saves resources)
 };
 
 // ─────────────────────────────────────────────────────────
@@ -32,15 +19,14 @@ const YF_INTERVAL = {
 // Asia:    7:00pm — 9:30pm EST
 // ─────────────────────────────────────────────────────────
 function isActiveSession() {
-  const now      = new Date();
-  const utcMins  = now.getUTCHours() * 60 + now.getUTCMinutes();
-  // EST = UTC - 5 (standard) — adjust for DST if needed
-  const estMins  = (utcMins - 300 + 1440) % 1440;
+  const now     = new Date();
+  const utcMins = now.getUTCHours() * 60 + now.getUTCMinutes();
+  const estMins = (utcMins - 300 + 1440) % 1440;
 
-  const londonStart = 120;  // 2:00am EST
-  const londonEnd   = 270;  // 4:30am EST
-  const asiaStart   = 1140; // 7:00pm EST
-  const asiaEnd     = 1170; // 9:30pm EST
+  const londonStart = 120;   // 2:00am EST
+  const londonEnd   = 270;   // 4:30am EST
+  const asiaStart   = 1140;  // 7:00pm EST
+  const asiaEnd     = 1170;  // 9:30pm EST
 
   return (
     (estMins >= londonStart && estMins < londonEnd) ||
@@ -52,9 +38,20 @@ function currentSessionName() {
   const now     = new Date();
   const utcMins = now.getUTCHours() * 60 + now.getUTCMinutes();
   const estMins = (utcMins - 300 + 1440) % 1440;
-  if (estMins >= 120 && estMins < 270)  return "London";
+  if (estMins >= 120  && estMins < 270)  return "London";
   if (estMins >= 1140 && estMins < 1170) return "Asia";
   return "Outside session";
+}
+
+// Returns next session start time as a readable string
+function nextSessionInfo() {
+  const now     = new Date();
+  const utcMins = now.getUTCHours() * 60 + now.getUTCMinutes();
+  const estMins = (utcMins - 300 + 1440) % 1440;
+
+  if (estMins < 120)  return "London opens at 2:00am EST";
+  if (estMins < 1140) return "Asia opens at 7:00pm EST";
+  return "London opens at 2:00am EST tomorrow";
 }
 
 // ─────────────────────────────────────────────────────────
@@ -75,7 +72,7 @@ const LTF_TIMEFRAMES = [
 ];
 
 // ─────────────────────────────────────────────────────────
-// STATE — tracks setup progress
+// STATE — tracks setup progress per session
 // Resets after full setup fires or session ends
 // ─────────────────────────────────────────────────────────
 let state = {
@@ -85,6 +82,8 @@ let state = {
   chochDirection:  null,
   choch:           null,
   alertsSent:      new Set(),
+  lastSessionName: null,
+  scanTimer:       null,
 };
 
 function resetState() {
@@ -94,6 +93,23 @@ function resetState() {
   state.chochDirection = null;
   state.choch          = null;
   console.log("  🔄 State reset — ready for next setup.");
+}
+
+// ─────────────────────────────────────────────────────────
+// DYNAMIC SCAN INTERVAL
+// 60s during active session, 5 mins outside session
+// Restarts timer automatically when session changes
+// ─────────────────────────────────────────────────────────
+function scheduleScan() {
+  const active   = isActiveSession();
+  const interval = active ? CONFIG.activeScanMs : CONFIG.idleScanMs;
+
+  if (state.scanTimer) clearTimeout(state.scanTimer);
+
+  state.scanTimer = setTimeout(async () => {
+    await scan();
+    scheduleScan(); // reschedule after each scan
+  }, interval);
 }
 
 // ─────────────────────────────────────────────────────────
@@ -110,7 +126,6 @@ async function getCandles(interval, period, count) {
     const quotes = result?.quotes;
     if (!quotes || quotes.length === 0) return [];
 
-    // Take the last `count` candles
     const sliced = quotes.slice(-count);
 
     return sliced.map((q, i) => ({
@@ -236,7 +251,7 @@ function detectLTFAOI(candles, direction) {
   const fvgs     = detectFVGs(candles);
   const matching = fvgs.filter((f) => f.direction === direction);
   if (matching.length === 0) return null;
-  return matching[matching.length - 1]; // most recent
+  return matching[matching.length - 1];
 }
 
 // ─────────────────────────────────────────────────────────
@@ -250,7 +265,6 @@ function formatAlert(htfAOI, choch, ltfAOI, currentPrice, session) {
   const sl     = isBull
     ? "Below the impulse/correction low"
     : "Above the impulse/correction high";
-  const tp = "Most recent liquidity level";
 
   return (
     `${emoji} <b>NQ_Devbmt — FULL SETUP ALERT</b> ${arrow}\n` +
@@ -275,7 +289,7 @@ function formatAlert(htfAOI, choch, ltfAOI, currentPrice, session) {
     `━━━━━━━━━━━━━━━━━━━━\n` +
     `<b>Entry:</b> ${entry} at IC level\n` +
     `<b>SL:</b>    ${sl}\n` +
-    `<b>TP:</b>    ${tp}\n` +
+    `<b>TP:</b>    Most recent liquidity level\n` +
     `━━━━━━━━━━━━━━━━━━━━\n` +
     `✅ <i>All 3 conditions met. Check chart and place manually.</i>`
   );
@@ -298,23 +312,33 @@ async function sendTelegram(text) {
 }
 
 // ─────────────────────────────────────────────────────────
-// MAIN SCAN — runs every 60 seconds
+// MAIN SCAN — called every 60s (active) or 5min (idle)
 // ─────────────────────────────────────────────────────────
 async function scan() {
   const ts      = new Date().toISOString().slice(0, 16).replace("T", " ");
   const session = currentSessionName();
+  const active  = isActiveSession();
 
-  if (!isActiveSession()) {
-    if (state.htfAOI || state.htfTapped) {
+  // ── Outside session ──
+  if (!active) {
+    // Reset state when session just ended
+    if (state.lastSessionName && state.lastSessionName !== "Outside session") {
       console.log(`[${ts}] 💤 Session ended — resetting state.`);
       resetState();
-    } else {
-      console.log(`[${ts}] 💤 ${session} — waiting for active session.`);
     }
+    state.lastSessionName = "Outside session";
+    console.log(`[${ts}] 💤 Idle — ${nextSessionInfo()} (scanning every 5 min)`);
     return;
   }
 
-  console.log(`\n[${ts} UTC] 🔍 ${session} session active — scanning NQ...`);
+  // Track session change
+  if (state.lastSessionName !== session) {
+    console.log(`[${ts}] 🟡 ${session} session started — resetting state for fresh scan.`);
+    resetState();
+    state.lastSessionName = session;
+  }
+
+  console.log(`\n[${ts} UTC] 🔍 ${session} session — scanning NQ...`);
 
   try {
 
@@ -329,8 +353,8 @@ async function scan() {
         const fvgs = detectFVGs(candles);
         if (fvgs.length === 0) continue;
 
-        const latest      = fvgs[fvgs.length - 1];
-        state.htfAOI      = { ...latest, timeframe: tf.name };
+        const latest = fvgs[fvgs.length - 1];
+        state.htfAOI = { ...latest, timeframe: tf.name };
 
         console.log(
           `  ✅ HTF AOI found on ${tf.name}: ${latest.direction} FVG ` +
@@ -352,7 +376,7 @@ async function scan() {
 
       console.log(
         `  Step 2: Price ${price.toFixed(2)} — watching HTF AOI ` +
-        `${state.htfAOI.bottom.toFixed(2)}—${state.htfAOI.top.toFixed(2)}...`
+        `${state.htfAOI.bottom.toFixed(2)} — ${state.htfAOI.top.toFixed(2)}...`
       );
 
       if (isPriceTappingAOI(price, state.htfAOI)) {
@@ -408,7 +432,7 @@ async function scan() {
       return;
     }
 
-    // ── STEP 4: Wait for LTF AOI tap — fire alert ───────
+    // ── STEP 4: Wait for LTF AOI tap — fire full alert ──
     console.log(`  Step 4: Looking for LTF AOI in ${state.chochDirection} direction...`);
 
     const price = await getCurrentPrice();
@@ -423,11 +447,9 @@ async function scan() {
 
       if (!isPriceTappingAOI(price, ltfAOI)) continue;
 
-      // Unique key to prevent duplicate alerts
       const alertKey = `${state.htfAOI.timeframe}_${ltfAOI.time}_${price.toFixed(0)}`;
       if (state.alertsSent.has(alertKey)) continue;
 
-      // ALL CONDITIONS MET — FIRE FULL ALERT
       console.log("  🚨 ALL CONDITIONS MET — Firing full alert!");
 
       const message = formatAlert(
@@ -440,8 +462,6 @@ async function scan() {
 
       await sendTelegram(message);
       state.alertsSent.add(alertKey);
-
-      // Reset for next setup
       resetState();
       break;
     }
@@ -469,7 +489,7 @@ function validateConfig() {
   }
 
   console.log("✅ Environment variables loaded.");
-  console.log("✅ No API key needed — using Yahoo Finance (free, no signup).");
+  console.log("✅ Yahoo Finance — no API key needed, no rate limits.");
 }
 
 // ─────────────────────────────────────────────────────────
@@ -487,7 +507,7 @@ async function start() {
   console.log("⏰  Active sessions (EST):");
   console.log("    London: 2:00am — 4:30am");
   console.log("    Asia:   7:00pm — 9:30pm");
-  console.log("🔄  Scan interval: every 60 seconds");
+  console.log("🔄  Scan: 60s during session / 5min outside session");
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
   await sendTelegram(
@@ -500,11 +520,13 @@ async function start() {
     `1️⃣ HTF AOI tapped → first alert fires\n` +
     `2️⃣ LTF ChoCh confirmed in same direction\n` +
     `3️⃣ LTF AOI tapped → full setup alert fires\n\n` +
-    `<i>Bot scans every 60 seconds. You will be notified at each stage.</i>`
+    `<b>Scan rate:</b> 60s during session / 5min when idle\n\n` +
+    `<i>Waiting for active session to begin...</i>`
   );
 
+  // Run first scan immediately then schedule dynamically
   await scan();
-  setInterval(scan, CONFIG.scanInterval);
+  scheduleScan();
 }
 
 process.on("unhandledRejection", (err) => {
