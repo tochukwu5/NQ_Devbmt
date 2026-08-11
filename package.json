@@ -1,7 +1,7 @@
 {
   "name": "playbook-v2-bot",
   "version": "1.0.0",
-  "description": "Playbook V2 NQ alert bot — Yahoo Finance + Telegram",
+  "description": "NQ_Devbmt alert bot — Yahoo Finance direct HTTP + Telegram",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -10,7 +10,6 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "axios": "^1.6.8",
-    "yahoo-finance2": "^4.0.0"
+    "axios": "^1.6.8"
   }
 }
