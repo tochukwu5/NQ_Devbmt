@@ -608,7 +608,6 @@ async function start() {
 
   await sendTelegram(
     `🤖 <b>NQ_Devbmt Bot Online</b>\n\n` +
-    `<b>Data:</b> Yahoo Finance direct API\n\n` +
     `<b>Sessions:</b>\n• London: 2:00am — 4:30am EST\n• Asia: 7:00pm — 9:30pm EST\n\n` +
     `<b>Alerts:</b>\n1️⃣ HTF AOI tapped\n2️⃣ LTF ChoCh confirmed\n3️⃣ LTF AOI tapped → full alert\n\n` +
     `<i>Waiting for active session...</i>`
