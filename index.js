@@ -1,33 +1,19 @@
 const axios = require("axios");
 
 // ─────────────────────────────────────────────────────────
-// WHY WE USE DIRECT HTTP INSTEAD OF yahoo-finance2 LIBRARY
-//
-// yahoo-finance2 v4 changed to a class (must use new YahooFinance())
-// AND Railway's network egress blocks the Yahoo Finance domain by
-// default, causing every library call to fail silently.
-//
-// This version calls Yahoo Finance's public JSON endpoints directly
-// via axios — same data, no library restrictions, works on Railway.
-// ─────────────────────────────────────────────────────────
-
-// ─────────────────────────────────────────────────────────
 // CONFIG
 // ─────────────────────────────────────────────────────────
 const CONFIG = {
   telegramToken:  process.env.TELEGRAM_TOKEN,
   telegramChatId: process.env.TELEGRAM_CHAT_ID,
-  symbol:         "NQ%3DF",      // NQ=F URL-encoded for Yahoo Finance
+  symbol:         "NQ%3DF",
   symbolDisplay:  "NQ=F",
   activeScanMs:   60  * 1000,
   idleScanMs:     5 * 60 * 1000,
 };
 
-// Yahoo Finance v8 chart endpoint — public, no auth needed
 const YF_BASE = "https://query1.finance.yahoo.com/v8/finance/chart";
 
-// Valid Yahoo Finance intervals
-// NOTE: Yahoo has NO native 4h — we build it from 60m candles
 const YF_INTERVALS = {
   "1m":  "1m",
   "5m":  "5m",
@@ -38,9 +24,25 @@ const YF_INTERVALS = {
 };
 
 // ─────────────────────────────────────────────────────────
+// MINIMUM FVG SIZE PER TIMEFRAME (NQ points)
+// This is the most important filter — prevents micro gaps
+// from being detected as real tradeable FVG zones
+// 15m: 20pts | 30m: 25pts | 1H: 35pts | 4H: 60pts | 1D: 100pts
+// ─────────────────────────────────────────────────────────
+const MIN_FVG_SIZE = {
+  "15m": 20,
+  "30m": 25,
+  "1H":  35,
+  "4H":  60,
+  "1D":  100,
+  "1m":  5,
+  "5m":  10,
+};
+
+// ─────────────────────────────────────────────────────────
 // SESSION HOURS (EST)
-// London:  2:00am — 4:30am  (120 — 270 mins)
-// Asia:    7:00pm — 9:30pm  (1140 — 1290 mins)
+// London:  2:00am — 4:30am  (120 — 270)
+// Asia:    7:00pm — 9:30pm  (1140 — 1290)
 // ─────────────────────────────────────────────────────────
 function getEstMins() {
   const utcMins = new Date().getUTCHours() * 60 + new Date().getUTCMinutes();
@@ -118,9 +120,7 @@ function scheduleScan() {
 }
 
 // ─────────────────────────────────────────────────────────
-// FETCH CANDLES DIRECTLY FROM YAHOO FINANCE JSON API
-// Uses axios so Railway egress settings control access
-// Add query1.finance.yahoo.com to Railway egress allowlist
+// FETCH CANDLES FROM YAHOO FINANCE
 // ─────────────────────────────────────────────────────────
 async function getCandles(intervalKey, lookbackDays, count) {
   try {
@@ -128,33 +128,18 @@ async function getCandles(intervalKey, lookbackDays, count) {
     const period2    = Math.floor(Date.now() / 1000);
     const period1    = period2 - lookbackDays * 24 * 60 * 60;
 
-    const url = `${YF_BASE}/${CONFIG.symbol}`;
-    const res = await axios.get(url, {
-      params: {
-        interval:       yfInterval,
-        period1,
-        period2,
-        includePrePost: true,
-        events:         "div|split",
-      },
-      headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; NQBot/1.0)",
-      },
+    const res = await axios.get(`${YF_BASE}/${CONFIG.symbol}`, {
+      params: { interval: yfInterval, period1, period2, includePrePost: true },
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; NQBot/1.0)" },
       timeout: 15000,
     });
 
     const result = res.data?.chart?.result?.[0];
-    if (!result) {
-      console.log(`    ⚠️  No data returned for ${intervalKey}`);
-      return [];
-    }
+    if (!result) { console.log(`    ⚠️  No data for ${intervalKey}`); return []; }
 
     const timestamps = result.timestamp ?? [];
     const ohlc       = result.indicators?.quote?.[0];
-    if (!ohlc || timestamps.length === 0) {
-      console.log(`    ⚠️  Empty OHLC for ${intervalKey}`);
-      return [];
-    }
+    if (!ohlc || timestamps.length === 0) return [];
 
     const candles = [];
     for (let i = 0; i < timestamps.length; i++) {
@@ -163,38 +148,24 @@ async function getCandles(intervalKey, lookbackDays, count) {
       const l = ohlc.low?.[i];
       const c = ohlc.close?.[i];
       if (o == null || h == null || l == null || c == null) continue;
-
       candles.push({
-        open:     o,
-        high:     h,
-        low:      l,
-        close:    c,
+        open: o, high: h, low: l, close: c,
         datetime: new Date(timestamps[i] * 1000).toISOString(),
-        ts:       timestamps[i],
+        ts: timestamps[i],
       });
     }
 
-    // Mark last candle as potentially live
     const sliced = candles.slice(-count);
-    return sliced.map((c, i) => ({
-      ...c,
-      isLive: i === sliced.length - 1,
-    }));
+    return sliced.map((c, i) => ({ ...c, isLive: i === sliced.length - 1 }));
 
   } catch (err) {
-    if (err.response?.status) {
-      console.error(`    ❌ Yahoo HTTP ${err.response.status} for ${intervalKey}`);
-    } else {
-      console.error(`    ❌ Fetch error (${intervalKey}): ${err.message}`);
-    }
+    console.error(`    ❌ Fetch error (${intervalKey}): ${err.message}`);
     return [];
   }
 }
 
 // ─────────────────────────────────────────────────────────
-// AGGREGATE 60m CANDLES INTO SYNTHETIC 4H CANDLES
-// Yahoo has no native 4h interval — we build it from hourly bars
-// Groups every 4 consecutive 1H candles into one 4H candle
+// AGGREGATE 60m INTO SYNTHETIC 4H CANDLES
 // ─────────────────────────────────────────────────────────
 function aggregateTo4h(hourlyCandles, targetCount) {
   const closed = hourlyCandles.filter((c) => !c.isLive);
@@ -214,7 +185,6 @@ function aggregateTo4h(hourlyCandles, targetCount) {
     });
   }
 
-  // Add live/partial 4H candle from remaining hourly bars
   const remainder = closed.slice(Math.floor(closed.length / 4) * 4);
   if (remainder.length > 0) {
     groups.push({
@@ -232,7 +202,7 @@ function aggregateTo4h(hourlyCandles, targetCount) {
 }
 
 // ─────────────────────────────────────────────────────────
-// GET CANDLES FOR A TIMEFRAME — handles 4H aggregation
+// GET CANDLES FOR TIMEFRAME — handles 4H aggregation
 // ─────────────────────────────────────────────────────────
 async function getCandlesForTF(tf) {
   if (!tf.aggregate4h) {
@@ -240,11 +210,9 @@ async function getCandlesForTF(tf) {
     console.log(`    📊 ${tf.name}: ${raw.length} candles`);
     return raw;
   }
-
-  // 4H: fetch hourly then aggregate
   const hourly = await getCandles("1H", tf.lookbackDays, tf.count * 4 + 10);
   const agg    = aggregateTo4h(hourly, tf.count);
-  console.log(`    📊 4H (from ${hourly.length} hourly): ${agg.length} synthetic candles`);
+  console.log(`    📊 4H (from ${hourly.length} hourly): ${agg.length} candles`);
   return agg;
 }
 
@@ -254,15 +222,15 @@ async function getCandlesForTF(tf) {
 async function getCurrentPrice() {
   try {
     const res = await axios.get(`${YF_BASE}/${CONFIG.symbol}`, {
-      params: { interval: "1m", period1: Math.floor(Date.now() / 1000) - 120, period2: Math.floor(Date.now() / 1000) },
+      params: {
+        interval: "1m",
+        period1:  Math.floor(Date.now() / 1000) - 120,
+        period2:  Math.floor(Date.now() / 1000),
+      },
       headers: { "User-Agent": "Mozilla/5.0 (compatible; NQBot/1.0)" },
       timeout: 10000,
     });
-
-    const result = res.data?.chart?.result?.[0];
-    const meta   = result?.meta;
-
-    // regularMarketPrice is the most reliable live price from meta
+    const meta  = res.data?.chart?.result?.[0]?.meta;
     const price = meta?.regularMarketPrice ?? meta?.chartPreviousClose ?? null;
     if (price) console.log(`    💰 NQ price: ${price.toFixed(2)}`);
     return price;
@@ -274,13 +242,13 @@ async function getCurrentPrice() {
 
 // ─────────────────────────────────────────────────────────
 // DETECT FVG ZONES
-// Bullish FVG: c3.low > c1.high — gap above (upward impulse)
-// Bearish FVG: c3.high < c1.low — gap below (downward impulse)
-// Filters: minimum 2pt gap, must be within 800pts of price
+// KEY FIX: Each timeframe has its own minimum FVG size
+// This prevents micro gaps from triggering false alerts
 // ─────────────────────────────────────────────────────────
-function detectFVGs(candles, currentPrice = null) {
-  const fvgs   = [];
-  const closed = candles.filter((c) => !c.isLive);
+function detectFVGs(candles, timeframeName, currentPrice = null) {
+  const fvgs    = [];
+  const closed  = candles.filter((c) => !c.isLive);
+  const minSize = MIN_FVG_SIZE[timeframeName] ?? 20; // default 20pts
 
   for (let i = 0; i < closed.length - 2; i++) {
     const c1 = closed[i];
@@ -289,10 +257,10 @@ function detectFVGs(candles, currentPrice = null) {
 
     if (!c1.high || !c3.low || !c1.low || !c3.high) continue;
 
-    // Bullish FVG
+    // Bullish FVG: c3.low > c1.high
     if (c3.low > c1.high) {
       const size = c3.low - c1.high;
-      if (size < 2) continue;
+      if (size < minSize) continue; // ← KEY FILTER
       const fvg = {
         type: "BULLISH", direction: "BULLISH",
         top: c3.low, bottom: c1.high,
@@ -303,10 +271,10 @@ function detectFVGs(candles, currentPrice = null) {
       fvgs.push(fvg);
     }
 
-    // Bearish FVG
+    // Bearish FVG: c3.high < c1.low
     if (c3.high < c1.low) {
       const size = c1.low - c3.high;
-      if (size < 2) continue;
+      if (size < minSize) continue; // ← KEY FILTER
       const fvg = {
         type: "BEARISH", direction: "BEARISH",
         top: c1.low, bottom: c3.high,
@@ -316,6 +284,12 @@ function detectFVGs(candles, currentPrice = null) {
       if (currentPrice && Math.abs(fvg.midpoint - currentPrice) > 800) continue;
       fvgs.push(fvg);
     }
+  }
+
+  if (fvgs.length > 0) {
+    console.log(`    ✅ ${fvgs.length} valid FVG(s) on ${timeframeName} (min size: ${minSize}pts)`);
+  } else {
+    console.log(`    ℹ️  No FVGs meeting ${minSize}pt minimum on ${timeframeName}`);
   }
 
   return fvgs;
@@ -331,19 +305,17 @@ function isPriceTappingAOI(price, aoi) {
 
 // ─────────────────────────────────────────────────────────
 // DETECT CHOCH ON LTF
-// Bullish ChoCh: closes 3+ points above recent 10-bar swing high
-// Bearish ChoCh: closes 3+ points below recent 10-bar swing low
+// Requires 3pt minimum break to filter noise
 // ─────────────────────────────────────────────────────────
 function detectChoCh(candles) {
   const closed  = candles.filter((c) => !c.isLive);
-  // Use last closed candle as current if no live candle
   const current = candles.find((c) => c.isLive) ?? closed[closed.length - 1];
   if (!current || closed.length < 5) return null;
 
   const lookback  = closed.slice(-10);
   const swingHigh = Math.max(...lookback.map((c) => c.high));
   const swingLow  = Math.min(...lookback.map((c) => c.low));
-  const minBreak  = 3; // require 3pt break to filter noise
+  const minBreak  = 3;
 
   if (current.close > swingHigh + minBreak) {
     return {
@@ -365,16 +337,16 @@ function detectChoCh(candles) {
 }
 
 // ─────────────────────────────────────────────────────────
-// DETECT LTF AOI MATCHING CHOCH DIRECTION
+// DETECT LTF AOI
 // ─────────────────────────────────────────────────────────
-function detectLTFAOI(candles, direction, price) {
-  const fvgs     = detectFVGs(candles, price);
+function detectLTFAOI(candles, timeframeName, direction, price) {
+  const fvgs     = detectFVGs(candles, timeframeName, price);
   const matching = fvgs.filter((f) => f.direction === direction);
   return matching.length > 0 ? matching[matching.length - 1] : null;
 }
 
 // ─────────────────────────────────────────────────────────
-// FORMAT TELEGRAM ALERT
+// FORMAT ALERT MESSAGE
 // ─────────────────────────────────────────────────────────
 function formatAlert(htfAOI, choch, ltfAOI, price, session) {
   const isBull = choch.direction === "BULLISH";
@@ -392,7 +364,7 @@ function formatAlert(htfAOI, choch, ltfAOI, price, session) {
     `<b>Price:</b>       ${price?.toFixed(2) ?? "—"}\n` +
     `━━━━━━━━━━━━━━━━━━━━\n` +
     `<b>Step 1 — HTF AOI (${htfAOI.timeframe}):</b>\n` +
-    `  ${htfAOI.direction} FVG\n` +
+    `  ${htfAOI.direction} FVG — Size: ${htfAOI.size.toFixed(2)}pts\n` +
     `  Top:    ${htfAOI.top.toFixed(2)}\n` +
     `  Bottom: ${htfAOI.bottom.toFixed(2)}\n` +
     `━━━━━━━━━━━━━━━━━━━━\n` +
@@ -400,7 +372,7 @@ function formatAlert(htfAOI, choch, ltfAOI, price, session) {
     `  ${choch.signal}\n` +
     `━━━━━━━━━━━━━━━━━━━━\n` +
     `<b>Step 3 — LTF AOI Tapped:</b>\n` +
-    `  ${ltfAOI.direction} FVG/OB\n` +
+    `  ${ltfAOI.direction} FVG — Size: ${ltfAOI.size.toFixed(2)}pts\n` +
     `  Top:    ${ltfAOI.top.toFixed(2)}\n` +
     `  Bottom: ${ltfAOI.bottom.toFixed(2)}\n` +
     `━━━━━━━━━━━━━━━━━━━━\n` +
@@ -438,7 +410,7 @@ async function scan() {
 
   if (!active) {
     if (state.lastSessionName && state.lastSessionName !== "Outside session") {
-      console.log(`[${ts}] 💤 Session ended — resetting state.`);
+      console.log(`[${ts}] 💤 Session ended — resetting.`);
       resetState();
     }
     state.lastSessionName = "Outside session";
@@ -456,20 +428,19 @@ async function scan() {
 
   try {
 
-    // ── STEP 1: Find HTF AOI near current price ──────────
+    // ── STEP 1: Find HTF AOI near price ─────────────────
     if (!state.htfAOI) {
       console.log("  Step 1: Finding HTF AOI...");
       const priceNow = await getCurrentPrice();
-      if (!priceNow) { console.log("  ⚠️  No price — skipping."); return; }
+      if (!priceNow) { console.log("  ⚠️  No price."); return; }
 
       for (const tf of HTF_TIMEFRAMES) {
         const candles = await getCandlesForTF(tf);
         if (candles.length < 4) continue;
 
-        const fvgs = detectFVGs(candles, priceNow);
-        if (fvgs.length === 0) { console.log(`    ℹ️  No FVGs near price on ${tf.name}`); continue; }
+        const fvgs = detectFVGs(candles, tf.name, priceNow);
+        if (fvgs.length === 0) continue;
 
-        // Pick FVG closest to current price
         const closest = fvgs.reduce((a, b) =>
           Math.abs(a.midpoint - priceNow) < Math.abs(b.midpoint - priceNow) ? a : b
         );
@@ -477,13 +448,14 @@ async function scan() {
         state.htfAOI = { ...closest, timeframe: tf.name };
         console.log(
           `  ✅ HTF AOI: ${closest.direction} FVG on ${tf.name} ` +
-          `[${closest.bottom.toFixed(2)} — ${closest.top.toFixed(2)}] ` +
+          `[${closest.bottom.toFixed(2)}—${closest.top.toFixed(2)}] ` +
+          `size: ${closest.size.toFixed(1)}pts | ` +
           `${Math.abs(closest.midpoint - priceNow).toFixed(0)}pts from price`
         );
         break;
       }
 
-      if (!state.htfAOI) { console.log("  ℹ️  No HTF AOI found."); return; }
+      if (!state.htfAOI) { console.log("  ℹ️  No qualifying HTF AOI found."); return; }
     }
 
     // ── STEP 2: Watch for price to tap HTF AOI ───────────
@@ -504,7 +476,7 @@ async function scan() {
           `⚡ <b>HTF AOI Tapped — NQ Futures</b>\n\n` +
           `<b>Session:</b>    ${session}\n` +
           `<b>Timeframe:</b>  ${state.htfAOI.timeframe}\n` +
-          `<b>Zone:</b>       ${state.htfAOI.direction} FVG\n` +
+          `<b>Zone:</b>       ${state.htfAOI.direction} FVG (${state.htfAOI.size.toFixed(1)}pts wide)\n` +
           `<b>Range:</b>      ${state.htfAOI.bottom.toFixed(2)} — ${state.htfAOI.top.toFixed(2)}\n` +
           `<b>Price:</b>      ${price.toFixed(2)}\n\n` +
           `<i>Watching for ${state.htfAOI.direction} ChoCh on 1m/5m...</i>`
@@ -525,7 +497,7 @@ async function scan() {
         if (!choch) { console.log(`    ℹ️  No ChoCh on ${ltf.name}`); continue; }
 
         if (choch.direction !== state.htfAOI.direction) {
-          console.log(`    ⚠️  ChoCh ${choch.direction} ≠ HTF ${state.htfAOI.direction} — skip`);
+          console.log(`    ⚠️  ChoCh ${choch.direction} ≠ need ${state.htfAOI.direction}`);
           continue;
         }
 
@@ -540,7 +512,7 @@ async function scan() {
       return;
     }
 
-    // ── STEP 4: Watch for LTF AOI tap → fire alert ──────
+    // ── STEP 4: Watch for LTF AOI tap → full alert ──────
     console.log(`  Step 4: Looking for ${state.chochDirection} LTF AOI...`);
     const price = await getCurrentPrice();
     if (!price) return;
@@ -549,13 +521,10 @@ async function scan() {
       const candles = await getCandles(ltf.interval, ltf.lookbackDays, ltf.count);
       if (candles.length < 4) continue;
 
-      const ltfAOI = detectLTFAOI(candles, state.chochDirection, price);
-      if (!ltfAOI) { console.log(`    ℹ️  No LTF AOI on ${ltf.name}`); continue; }
+      const ltfAOI = detectLTFAOI(candles, ltf.name, state.chochDirection, price);
+      if (!ltfAOI) continue;
 
-      console.log(
-        `    LTF AOI [${ltfAOI.bottom.toFixed(2)}—${ltfAOI.top.toFixed(2)}] ` +
-        `| Price ${price.toFixed(2)}`
-      );
+      console.log(`    LTF AOI [${ltfAOI.bottom.toFixed(2)}—${ltfAOI.top.toFixed(2)}] | Price ${price.toFixed(2)}`);
 
       if (!isPriceTappingAOI(price, ltfAOI)) { console.log("    ⏳ Not tapping yet."); continue; }
 
@@ -582,11 +551,7 @@ function validateConfig() {
     ["TELEGRAM_TOKEN",   CONFIG.telegramToken],
     ["TELEGRAM_CHAT_ID", CONFIG.telegramChatId],
   ].filter(([, v]) => !v).map(([k]) => k);
-
-  if (missing.length) {
-    console.error("❌ Missing env variables:", missing.join(", "));
-    process.exit(1);
-  }
+  if (missing.length) { console.error("❌ Missing:", missing.join(", ")); process.exit(1); }
   console.log("✅ Config valid.");
 }
 
@@ -596,19 +561,22 @@ function validateConfig() {
 async function start() {
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   console.log("🤖  NQ_Devbmt Alert Bot");
-  console.log("📊  NQ=F via Yahoo Finance direct HTTP");
-  console.log("🔧  No yahoo-finance2 library — axios only");
+  console.log("📊  NQ=F — Yahoo Finance direct HTTP");
+  console.log("🔧  FVG size filters: 15m≥20pt 30m≥25pt 1H≥35pt 4H≥60pt");
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
   validateConfig();
 
-  console.log("⏰  London 2:00-4:30am EST | Asia 7:00-9:30pm EST");
-  console.log("🔄  60s during session / 5min idle");
+  console.log("⏰  London 2:00-4:30am | Asia 7:00-9:30pm EST");
+  console.log("🔄  60s active / 5min idle");
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
   await sendTelegram(
     `🤖 <b>NQ_Devbmt Bot Online</b>\n\n` +
     `<b>Sessions:</b>\n• London: 2:00am — 4:30am EST\n• Asia: 7:00pm — 9:30pm EST\n\n` +
+    `<b>FVG minimum sizes:</b>\n` +
+    `• 15m: 20pts | 30m: 25pts\n` +
+    `• 1H: 35pts  | 4H: 60pts | 1D: 100pts\n\n` +
     `<b>Alerts:</b>\n1️⃣ HTF AOI tapped\n2️⃣ LTF ChoCh confirmed\n3️⃣ LTF AOI tapped → full alert\n\n` +
     `<i>Waiting for active session...</i>`
   );
